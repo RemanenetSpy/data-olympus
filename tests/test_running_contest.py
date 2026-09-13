@@ -12,6 +12,7 @@ Covers:
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -49,10 +50,8 @@ def _scoped_win_atomic_writes(monkeypatch):
                 raise
 
         def _win_atomic_remove(path: str) -> None:
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
-            except FileNotFoundError:
-                pass
 
         monkeypatch.setattr(pending_mod, "atomic_write_json", _win_atomic_write_json)
         monkeypatch.setattr(pending_mod, "atomic_remove", _win_atomic_remove)
@@ -269,6 +268,7 @@ def test_positive_contest_detection_and_contradicts_contract(tmp_path) -> None:
     r3 = q3.derive_running_contest(t3)
     assert r3.under_review is True
     assert r3.contested is True
+    assert r3.pending_id == pid3
     assert r3.contradicts == ["STD-U-001"]
 
     # 4. Contradicts list of strings
@@ -286,11 +286,14 @@ def test_positive_contest_detection_and_contradicts_contract(tmp_path) -> None:
     r4 = q4.derive_running_contest(t4)
     assert r4.under_review is True
     assert r4.contested is True
+    assert r4.pending_id == pid4
     assert r4.contradicts == ["STD-U-001", "STD-U-002"]
 
 
 def test_supersedes_only_is_not_contested(tmp_path) -> None:
-    """Contract: supersedes represents normal document succession and must NOT mark contested=True."""
+    """Contract: supersedes represents normal document succession
+    and must NOT mark contested=True.
+    """
     q = PendingQueue(pending_root=str(tmp_path / "p"))
     target = "universal/foundation/STD-U-005.md"
     pid = q.enqueue(
@@ -317,8 +320,14 @@ def test_orphan_lock_without_entry(tmp_path) -> None:
 
     # Fabricate a valid lock pointing to a non-existent pending_id
     orphan_id = "0123456789abcdef0123456789abcdef"
+    lock_data = {
+        "pending_id": orphan_id,
+        "holder": "test",
+        "acquired_at": 1000.0,
+        "target_path": target,
+    }
     with open(lock_file, "w", encoding="utf-8") as f:
-        json.dump({"pending_id": orphan_id, "holder": "test", "acquired_at": 1000.0, "target_path": target}, f)
+        json.dump(lock_data, f)
 
     receipt = q.derive_running_contest(target)
     assert receipt.under_review is False
@@ -365,8 +374,13 @@ def test_malformed_json_shapes_and_traversal_guards(tmp_path) -> None:
     assert r4.contradicts is None
 
 
-def test_claim_rename_race_interleaving(tmp_path) -> None:
-    """Must-fix 3: Interleaving between .json and .claimed handled by bounded retry."""
+def test_claim_rename_race_interleaving(tmp_path, monkeypatch) -> None:
+    """Must-fix 3: Interleaving between .json and .claimed handled by bounded retry.
+
+    Forces a mid-call rename: the first attempt to open <pid>.json raises
+    FileNotFoundError while simulating an active resolver renaming it to <pid>.claimed,
+    verifying that the retry loop recovers and reads the claimed entry.
+    """
     q = PendingQueue(pending_root=str(tmp_path / "p"))
     target = "universal/foundation/STD-U-008.md"
     pid = q.enqueue(
@@ -379,12 +393,26 @@ def test_claim_rename_race_interleaving(tmp_path) -> None:
         meta={"reason": "Testing rename race"},
     )
 
-    # Simulate race: rename to .claimed right under the path lock
     json_path = os.path.join(q.root, f"{pid}.json")
     claimed_path = os.path.join(q.root, f"{pid}.claimed")
-    os.rename(json_path, claimed_path)
+
+    real_open = open
+    has_renamed = False
+
+    def race_injected_open(file, *args, **kwargs):
+        nonlocal has_renamed
+        # Mid-call fault injection: when derive_running_contest first calls open on <pid>.json,
+        # rename it to <pid>.claimed and raise FileNotFoundError to simulate resolver race.
+        if not has_renamed and os.path.abspath(str(file)) == os.path.abspath(json_path):
+            has_renamed = True
+            os.rename(json_path, claimed_path)
+            raise FileNotFoundError(f"Simulated race: {file} moved to .claimed")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", race_injected_open)
 
     receipt = q.derive_running_contest(target)
+    assert has_renamed is True
     assert receipt.under_review is True
     assert receipt.pending_id == pid
     assert receipt.reason == "Testing rename race"

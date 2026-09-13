@@ -586,8 +586,13 @@ class PendingQueue:
             `meta` mapping defines any of the following fields:
             - `intent`: literal string `"contest"`.
             - `dispute`: boolean `True`.
-            - `contradicts`: a single target identifier string or list of target identifier strings
-              referencing decisions or assertions contradicted by this proposal (normalized to `list[str]`).
+            - `contradicts`: a target identifier string or list of identifier strings referencing
+              decisions contradicted by this proposal (normalized to `list[str]`; empty strings
+              normalize to `[]`).
+
+            The 3-attempt retry loop across `.json` and `.claimed` provides a best-effort
+            resolution guard against active resolver rename cadences, returning
+            `under_review=False` if all attempts encounter files being moved.
 
             Note: Per issue #241 maintainer consensus, `supersedes` represents standard document
             lineage and decision-chain succession, not an active contest, and is deliberately
@@ -603,21 +608,29 @@ class PendingQueue:
             )
 
         try:
-            with open(lock_path, "r", encoding="utf-8") as f:
+            with open(lock_path, encoding="utf-8") as f:
                 lock_info = json.load(f)
         except (FileNotFoundError, ValueError):
-            return RunningContestReceipt(target_path=target_path, under_review=False, contested=False)
+            return RunningContestReceipt(
+                target_path=target_path, under_review=False, contested=False
+            )
 
         if not isinstance(lock_info, Mapping):
-            return RunningContestReceipt(target_path=target_path, under_review=False, contested=False)
+            return RunningContestReceipt(
+                target_path=target_path, under_review=False, contested=False
+            )
 
         owner_kind = lock_info.get("owner_kind", "pending")
         if owner_kind == "auto_commit":
-            return RunningContestReceipt(target_path=target_path, under_review=False, contested=False)
+            return RunningContestReceipt(
+                target_path=target_path, under_review=False, contested=False
+            )
 
         pending_id = lock_info.get("pending_id")
         if not isinstance(pending_id, str) or not _PENDING_ID_RE.fullmatch(pending_id):
-            return RunningContestReceipt(target_path=target_path, under_review=False, contested=False)
+            return RunningContestReceipt(
+                target_path=target_path, under_review=False, contested=False
+            )
 
         # Bounded retry across .json and .claimed to eliminate the rename race
         # where _claim renames .json -> .claimed or restore_resolve renames .claimed -> .json
@@ -627,7 +640,7 @@ class PendingQueue:
             for ext in (".json", ".claimed"):
                 entry_file = os.path.join(self._root, f"{pending_id}{ext}")
                 try:
-                    with open(entry_file, "r", encoding="utf-8") as f:
+                    with open(entry_file, encoding="utf-8") as f:
                         data = json.load(f)
                     if isinstance(data, Mapping):
                         entry = data
@@ -638,7 +651,9 @@ class PendingQueue:
                 break
 
         if entry is None:
-            return RunningContestReceipt(target_path=target_path, under_review=False, contested=False)
+            return RunningContestReceipt(
+                target_path=target_path, under_review=False, contested=False
+            )
 
         raw_meta = entry.get("meta")
         meta = raw_meta if isinstance(raw_meta, Mapping) else {}
@@ -658,5 +673,9 @@ class PendingQueue:
             pending_id=pending_id,
             reason=meta.get("reason") if isinstance(meta.get("reason"), str) else None,
             contradicts=contradicts_list,
-            agent_identity=meta.get("agent_identity") if isinstance(meta.get("agent_identity"), str) else None,
+            agent_identity=(
+                meta.get("agent_identity")
+                if isinstance(meta.get("agent_identity"), str)
+                else None
+            ),
         )
